@@ -35,97 +35,163 @@
 static bool bdev_allow_write_mounted = IS_ENABLED(CONFIG_BLK_DEV_WRITE_MOUNTED);
 
 struct bdev_inode {
-	struct block_device bdev;
-	struct inode vfs_inode;
+    struct block_device bdev;
+    struct inode vfs_inode;
 };
 
-static inline struct bdev_inode *BDEV_I(struct inode *inode)
-{
-	return container_of(inode, struct bdev_inode, vfs_inode);
+static inline struct bdev_inode *BDEV_I(struct inode *inode) {
+    return container_of(inode, struct bdev_inode, vfs_inode);
 }
 
-static inline struct inode *BD_INODE(struct block_device *bdev)
-{
-	return &container_of(bdev, struct bdev_inode, bdev)->vfs_inode;
+static inline struct inode *BD_INODE(struct block_device *bdev) {
+    return &container_of(bdev, struct bdev_inode, bdev)->vfs_inode;
 }
 
-struct block_device *I_BDEV(struct inode *inode)
-{
-	return &BDEV_I(inode)->bdev;
+struct block_device *I_BDEV(struct inode *inode) {
+    return &BDEV_I(inode)->bdev;
 }
 EXPORT_SYMBOL(I_BDEV);
 
-struct block_device *file_bdev(struct file *bdev_file)
-{
-	return I_BDEV(bdev_file->f_mapping->host);
+struct block_device *file_bdev(struct file *bdev_file) {
+    if (!bdev_file || !bdev_file->f_mapping) {
+        pr_err("file_bdev: Invalid file structure\n");
+        return NULL;
+    }
+    return I_BDEV(bdev_file->f_mapping->host);
 }
 EXPORT_SYMBOL(file_bdev);
 
-static void bdev_write_inode(struct block_device *bdev)
-{
-	struct inode *inode = BD_INODE(bdev);
-	int ret;
+static void bdev_write_inode(struct block_device *bdev) {
+    struct inode *inode = BD_INODE(bdev);
+    int ret;
 
-	spin_lock(&inode->i_lock);
-	while (inode->i_state & I_DIRTY) {
-		spin_unlock(&inode->i_lock);
-		ret = write_inode_now(inode, true);
-		if (ret)
-			pr_warn_ratelimited(
-	"VFS: Dirty inode writeback failed for block device %pg (err=%d).\n",
-				bdev, ret);
-		spin_lock(&inode->i_lock);
-	}
-	spin_unlock(&inode->i_lock);
+    if (!inode) {
+        pr_warn("bdev_write_inode: Invalid inode\n");
+        return;
+    }
+
+    spin_lock(&inode->i_lock);
+    while (inode->i_state & I_DIRTY) {
+        spin_unlock(&inode->i_lock);
+        ret = write_inode_now(inode, true);
+        if (ret) {
+            pr_warn_ratelimited(
+                "VFS: Dirty inode writeback failed for block device %pg (err=%d).\n",
+                bdev, ret);
+        }
+        spin_lock(&inode->i_lock);
+    }
+    spin_unlock(&inode->i_lock);
 }
 
-/* Kill _all_ buffers and pagecache , dirty or not.. */
-static void kill_bdev(struct block_device *bdev)
-{
-	struct address_space *mapping = bdev->bd_mapping;
+/* Kill all buffers and pagecache, dirty or not */
+static void kill_bdev(struct block_device *bdev) {
+    struct address_space *mapping;
 
-	if (mapping_empty(mapping))
-		return;
+    if (!bdev) {
+        pr_err("kill_bdev: Invalid block device\n");
+        return;
+    }
 
-	invalidate_bh_lrus();
-	truncate_inode_pages(mapping, 0);
+    mapping = bdev->bd_mapping;
+    if (!mapping || mapping_empty(mapping))
+        return;
+
+    invalidate_bh_lrus();
+    truncate_inode_pages(mapping, 0);
 }
 
-/* Invalidate clean unused buffers and pagecache. */
-void invalidate_bdev(struct block_device *bdev)
-{
-	struct address_space *mapping = bdev->bd_mapping;
+/* Invalidate clean unused buffers and pagecache */
+void invalidate_bdev(struct block_device *bdev) {
+    struct address_space *mapping;
 
-	if (mapping->nrpages) {
-		invalidate_bh_lrus();
-		lru_add_drain_all();	/* make sure all lru add caches are flushed */
-		invalidate_mapping_pages(mapping, 0, -1);
-	}
+    if (!bdev) {
+        pr_err("invalidate_bdev: Invalid block device\n");
+        return;
+    }
+
+    mapping = bdev->bd_mapping;
+    if (mapping->nrpages) {
+        invalidate_bh_lrus();
+        lru_add_drain_all(); /* Ensure all lru add caches are flushed */
+        invalidate_mapping_pages(mapping, 0, -1);
+    }
 }
 EXPORT_SYMBOL(invalidate_bdev);
 
 /*
- * Drop all buffers & page cache for given bdev range. This function bails
- * with error if bdev has other exclusive owner (such as filesystem).
+ * Drop all buffers & page cache for given bdev range. 
+ * Bails with error if bdev has another exclusive owner (e.g., filesystem).
  */
 int truncate_bdev_range(struct block_device *bdev, blk_mode_t mode,
-			loff_t lstart, loff_t lend)
-{
-	/*
-	 * If we don't hold exclusive handle for the device, upgrade to it
-	 * while we discard the buffer cache to avoid discarding buffers
-	 * under live filesystem.
-	 */
-	if (!(mode & BLK_OPEN_EXCL)) {
-		int err = bd_prepare_to_claim(bdev, truncate_bdev_range, NULL);
-		if (err)
-			goto invalidate;
-	}
+                        loff_t lstart, loff_t lend) {
+    if (!bdev) {
+        pr_err("truncate_bdev_range: Invalid block device\n");
+        return -EINVAL;
+    }
 
-	truncate_inode_pages_range(bdev->bd_mapping, lstart, lend);
-	if (!(mode & BLK_OPEN_EXCL))
-		bd_abort_claiming(bdev, truncate_bdev_range);
-	return 0;
+    if (!(mode & BLK_OPEN_EXCL)) {
+        int err = bd_prepare_to_claim(bdev, truncate_bdev_range, NULL);
+        if (err) {
+            pr_err("truncate_bdev_range: Exclusive claim failed\n");
+            return invalidate_inode_pages2_range(
+                bdev->bd_mapping,
+                lstart >> PAGE_SHIFT,
+                lend >> PAGE_SHIFT);
+        }
+    }
+
+    truncate_inode_pages_range(bdev->bd_mapping, lstart, lend);
+    if (!(mode & BLK_OPEN_EXCL))
+        bd_abort_claiming(bdev, truncate_bdev_range);
+
+    return 0;
+}
+
+static void set_init_blocksize(struct block_device *bdev) {
+    unsigned int bsize = bdev_logical_block_size(bdev);
+    loff_t size = i_size_read(BD_INODE(bdev));
+
+    if (!bdev) {
+        pr_err("set_init_blocksize: Invalid block device\n");
+        return;
+    }
+
+    while (bsize < PAGE_SIZE) {
+        if (size & bsize)
+            break;
+        bsize <<= 1;
+    }
+    BD_INODE(bdev)->i_blkbits = blksize_bits(bsize);
+}
+
+int set_blocksize(struct file *file, int size) {
+    struct inode *inode;
+    struct block_device *bdev;
+
+    if (!file || !file->f_mapping || !file->private_data) {
+        pr_err("set_blocksize: Invalid file structure\n");
+        return -EINVAL;
+    }
+
+    inode = file->f_mapping->host;
+    bdev = I_BDEV(inode);
+
+    if (blk_validate_block_size(size))
+        return -EINVAL;
+
+    if (size < bdev_logical_block_size(bdev))
+        return -EINVAL;
+
+    /* Don't change the size if it is same as current */
+    if (inode->i_blkbits != blksize_bits(size)) {
+        sync_blockdev(bdev);
+        inode->i_blkbits = blksize_bits(size);
+        kill_bdev(bdev);
+    }
+    return 0;
+}
+EXPORT_SYMBOL(set_blocksize);
 
 invalidate:
 	/*
